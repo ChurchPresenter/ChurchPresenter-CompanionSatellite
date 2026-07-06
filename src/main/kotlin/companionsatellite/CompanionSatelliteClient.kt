@@ -226,6 +226,10 @@ class CompanionSatelliteClient(
                 "TEXT" to true,
                 "TEXT_STYLE" to false,
                 "BRIGHTNESS" to false,
+                // Declares the capability so Companion's Surfaces settings panel offers a "change
+                // page" permission toggle for this device — CHANGE-PAGE is a no-op until the admin
+                // also enables that toggle there; this can't be turned on remotely by the client.
+                "CAN_CHANGE_PAGE" to "Change page",
                 "VARIABLES" to Base64.getEncoder().encodeToString("[]".toByteArray())
             )
         )
