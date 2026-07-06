@@ -44,6 +44,11 @@ class CompanionSatelliteClient(
     private val onButtonUpdated: (CompanionButtonUpdate) -> Unit,
     private val onButtonsReset: (count: Int) -> Unit
 ) {
+    companion object {
+        /** Companion's TCP layer times out an idle socket after 5s — ping comfortably under that. */
+        private const val PING_INTERVAL_MS = 2000L
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var connectJob: Job? = null
     private var socket: Socket? = null
@@ -99,9 +104,22 @@ class CompanionSatelliteClient(
                     socket = s
                     writer = s.getOutputStream()
                     val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
-                    while (scope.isActive) {
-                        val line = reader.readLine() ?: break
-                        handleLine(line, deviceId, rows, columns, bitmapSize)
+                    // Companion closes the TCP socket after 5s of no traffic in either direction
+                    // (net.Socket.setTimeout(5000) server-side) — ping well under that or Companion
+                    // drops us and our reconnect loop kicks in, forever.
+                    val pingJob = scope.launch {
+                        while (isActive) {
+                            delay(PING_INTERVAL_MS)
+                            writeLine("PING\n")
+                        }
+                    }
+                    try {
+                        while (scope.isActive) {
+                            val line = reader.readLine() ?: break
+                            handleLine(line, deviceId, rows, columns, bitmapSize)
+                        }
+                    } finally {
+                        pingJob.cancel()
                     }
                 }
             } catch (e: CancellationException) {
