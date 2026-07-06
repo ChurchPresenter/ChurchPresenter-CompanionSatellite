@@ -44,7 +44,8 @@ data class CompanionButtonUpdate(
 class CompanionSatelliteClient(
     private val onStatusChanged: (CompanionConnectionStatus, String?) -> Unit,
     private val onButtonUpdated: (CompanionButtonUpdate) -> Unit,
-    private val onButtonsReset: (count: Int) -> Unit
+    private val onButtonsReset: (count: Int) -> Unit,
+    private val onBrightnessChanged: (percent: Int) -> Unit = {}
 ) {
     companion object {
         /** Companion's TCP layer times out an idle socket after 5s — ping comfortably under that. */
@@ -60,11 +61,22 @@ class CompanionSatelliteClient(
 
     @Volatile private var currentStatus = CompanionConnectionStatus.DISCONNECTED
 
-    fun connect(host: String, port: Int, deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+    fun connect(
+        host: String,
+        port: Int,
+        deviceId: String,
+        rows: Int,
+        columns: Int,
+        bitmapSize: Int,
+        productName: String = "ChurchPresenter",
+        reconnectDelayMs: Long = 2000L
+    ) {
         disconnect()
         activeDeviceId = deviceId
         onButtonsReset(rows * columns)
-        connectJob = scope.launch { connectLoop(host, port, deviceId, rows, columns, bitmapSize) }
+        connectJob = scope.launch {
+            connectLoop(host, port, deviceId, rows, columns, bitmapSize, productName, reconnectDelayMs)
+        }
     }
 
     fun disconnect() {
@@ -111,7 +123,16 @@ class CompanionSatelliteClient(
         onStatusChanged(status, error)
     }
 
-    private suspend fun connectLoop(host: String, port: Int, deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+    private suspend fun connectLoop(
+        host: String,
+        port: Int,
+        deviceId: String,
+        rows: Int,
+        columns: Int,
+        bitmapSize: Int,
+        productName: String,
+        reconnectDelayMs: Long
+    ) {
         while (scope.isActive) {
             setStatus(CompanionConnectionStatus.CONNECTING, null)
             try {
@@ -131,7 +152,7 @@ class CompanionSatelliteClient(
                     try {
                         while (scope.isActive) {
                             val line = reader.readLine() ?: break
-                            handleLine(line, deviceId, rows, columns, bitmapSize)
+                            handleLine(line, deviceId, rows, columns, bitmapSize, productName)
                         }
                     } finally {
                         pingJob.cancel()
@@ -146,11 +167,11 @@ class CompanionSatelliteClient(
             writer = null
             if (currentStatus != CompanionConnectionStatus.ERROR) setStatus(CompanionConnectionStatus.DISCONNECTED, null)
             if (!scope.isActive) break
-            delay(2000)
+            delay(reconnectDelayMs)
         }
     }
 
-    private fun handleLine(line: String, deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+    private fun handleLine(line: String, deviceId: String, rows: Int, columns: Int, bitmapSize: Int, productName: String) {
         val trimmed = line.removeSuffix("\r")
         val spaceIndex = trimmed.indexOf(' ')
         val cmd = if (spaceIndex == -1) trimmed else trimmed.substring(0, spaceIndex)
@@ -159,7 +180,7 @@ class CompanionSatelliteClient(
 
         when (cmd.uppercase()) {
             "PING" -> writeLine("PONG $body\n")
-            "BEGIN" -> registerDevice(deviceId, rows, columns, bitmapSize)
+            "BEGIN" -> registerDevice(deviceId, rows, columns, bitmapSize, productName)
             "ADD-DEVICE" -> {
                 if ("OK" in params) {
                     setStatus(CompanionConnectionStatus.CONNECTED, null)
@@ -169,8 +190,8 @@ class CompanionSatelliteClient(
             }
             "KEY-STATE" -> handleKeyState(params, bitmapSize)
             "KEYS-CLEAR" -> onButtonsReset(rows * columns)
-            // BRIGHTNESS has no physical meaning for a software surface; PONG/REMOVE-DEVICE/
-            // DEVICE-CONFIG/CAPS need no action for a plain grid client.
+            "BRIGHTNESS" -> params["VALUE"]?.toIntOrNull()?.let { onBrightnessChanged(it) }
+            // PONG/REMOVE-DEVICE/DEVICE-CONFIG/CAPS need no action for a plain grid client.
             else -> {}
         }
     }
@@ -194,10 +215,10 @@ class CompanionSatelliteClient(
         )
     }
 
-    private fun registerDevice(deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+    private fun registerDevice(deviceId: String, rows: Int, columns: Int, bitmapSize: Int, productName: String) {
         sendMessage(
             "ADD-DEVICE", deviceId, linkedMapOf(
-                "PRODUCT_NAME" to "ChurchPresenter",
+                "PRODUCT_NAME" to productName,
                 "KEYS_TOTAL" to rows * columns,
                 "KEYS_PER_ROW" to columns,
                 "BITMAPS" to bitmapSize,
