@@ -10,9 +10,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.Base64
 
 enum class CompanionConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
@@ -53,6 +55,13 @@ class CompanionSatelliteClient(
     companion object {
         /** Companion's TCP layer times out an idle socket after 5s — ping comfortably under that. */
         private const val PING_INTERVAL_MS = 2000L
+        /** Bounds how long a dead-but-unclosed socket (cable pull, host sleep, silent NAT drop —
+         * no clean FIN/RST) can block [BufferedReader.readLine] before we notice. Generous relative
+         * to [PING_INTERVAL_MS] so a normal quiet period with no button-state traffic at all never
+         * trips a single timeout; only [MAX_CONSECUTIVE_READ_TIMEOUTS] of them in a row — meaning
+         * total silence for that whole span — is treated as the connection actually being gone. */
+        private const val READ_TIMEOUT_MS = 10_000
+        private const val MAX_CONSECUTIVE_READ_TIMEOUTS = 3
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -61,6 +70,13 @@ class CompanionSatelliteClient(
     private var writer: OutputStream? = null
     private val writeLock = Any()
     private var activeDeviceId: String = ""
+
+    /** Bumped by every [connect]/[disconnect] call. A running [connectLoop] captures the
+     * generation it was started with and stops touching shared [socket]/[writer]/status state once
+     * a newer generation exists — otherwise a still-unwinding old job (cancellation is cooperative;
+     * a blocking [Socket] constructor or an in-flight read isn't a suspension point) can clobber the
+     * very state a newer, already-connected job just set. */
+    @Volatile private var generation: Long = 0
 
     @Volatile private var currentStatus = CompanionConnectionStatus.DISCONNECTED
 
@@ -81,14 +97,16 @@ class CompanionSatelliteClient(
         reconnectDelayMs: Long = 2000L
     ) {
         disconnect()
+        val myGeneration = ++generation
         activeDeviceId = deviceId
         onButtonsReset(rows * columns)
         connectJob = scope.launch {
-            connectLoop(host, port, deviceId, rows, columns, startRow, startColumn, bitmapSize, productName, reconnectDelayMs)
+            connectLoop(myGeneration, host, port, deviceId, rows, columns, startRow, startColumn, bitmapSize, productName, reconnectDelayMs)
         }
     }
 
     fun disconnect() {
+        generation++
         connectJob?.cancel()
         connectJob = null
         runCatching { socket?.close() }
@@ -136,6 +154,7 @@ class CompanionSatelliteClient(
     }
 
     private suspend fun connectLoop(
+        generation: Long,
         host: String,
         port: Int,
         deviceId: String,
@@ -147,10 +166,15 @@ class CompanionSatelliteClient(
         productName: String,
         reconnectDelayMs: Long
     ) {
-        while (scope.isActive) {
+        while (scope.isActive && generation == this.generation) {
             setStatus(CompanionConnectionStatus.CONNECTING, null)
             try {
                 Socket(host, port).use { s ->
+                    // A newer connect()/disconnect() call already superseded this job while the
+                    // (blocking) constructor above was running — close this now-useless socket via
+                    // `use`'s auto-close and leave the newer job's state alone.
+                    if (generation != this.generation) return@use
+                    s.soTimeout = READ_TIMEOUT_MS
                     socket = s
                     writer = s.getOutputStream()
                     val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
@@ -164,8 +188,22 @@ class CompanionSatelliteClient(
                         }
                     }
                     try {
-                        while (scope.isActive) {
-                            val line = reader.readLine() ?: break
+                        var consecutiveTimeouts = 0
+                        while (scope.isActive && generation == this.generation) {
+                            val line = try {
+                                reader.readLine()
+                            } catch (e: SocketTimeoutException) {
+                                consecutiveTimeouts++
+                                if (consecutiveTimeouts >= MAX_CONSECUTIVE_READ_TIMEOUTS) {
+                                    throw IOException(
+                                        "No data received for ${consecutiveTimeouts * READ_TIMEOUT_MS}ms — assuming dead connection",
+                                        e
+                                    )
+                                }
+                                continue
+                            }
+                            consecutiveTimeouts = 0
+                            if (line == null) break
                             handleLine(line, deviceId, rows, columns, startRow, startColumn, bitmapSize, productName)
                         }
                     } finally {
@@ -175,12 +213,14 @@ class CompanionSatelliteClient(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                setStatus(CompanionConnectionStatus.ERROR, e.message ?: "Connection failed")
+                if (generation == this.generation) setStatus(CompanionConnectionStatus.ERROR, e.message ?: "Connection failed")
             }
-            socket = null
-            writer = null
-            if (currentStatus != CompanionConnectionStatus.ERROR) setStatus(CompanionConnectionStatus.DISCONNECTED, null)
-            if (!scope.isActive) break
+            if (generation == this.generation) {
+                socket = null
+                writer = null
+                if (currentStatus != CompanionConnectionStatus.ERROR) setStatus(CompanionConnectionStatus.DISCONNECTED, null)
+            }
+            if (!scope.isActive || generation != this.generation) break
             delay(reconnectDelayMs)
         }
     }
@@ -290,19 +330,25 @@ class CompanionSatelliteClient(
     private fun sendMessage(name: String, deviceId: String?, args: Map<String, Any>) {
         val line = buildString {
             append(name)
-            if (deviceId != null) append(" DEVICEID=\"").append(deviceId).append('"')
+            if (deviceId != null) append(" DEVICEID=\"").append(escapeValue(deviceId)).append('"')
             for ((key, value) in args) {
                 append(' ').append(key).append('=')
                 when (value) {
                     is Boolean -> append(if (value) "1" else "0")
                     is Number -> append(value.toString())
-                    else -> append('"').append(value.toString()).append('"')
+                    else -> append('"').append(escapeValue(value.toString())).append('"')
                 }
             }
             append('\n')
         }
         writeLine(line)
     }
+
+    /** Escapes `\` and `"` so a free-text value (device id, product name) can't break out of its
+     * quoted slot — [parseLineParameters] already understands these same backslash-escapes on the
+     * read side, so this just makes the write side use what the protocol already supports. */
+    private fun escapeValue(value: String): String =
+        value.replace("\\", "\\\\").replace("\"", "\\\"")
 
     private fun writeLine(line: String) {
         val out = writer ?: return
