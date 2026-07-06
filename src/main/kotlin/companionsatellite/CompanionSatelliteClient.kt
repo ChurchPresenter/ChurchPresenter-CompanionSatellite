@@ -32,11 +32,14 @@ data class CompanionButtonUpdate(
 
 /**
  * Client for Bitfocus Companion's Satellite protocol (plain TCP, default port 16622,
- * line-based `COMMAND key=value key2="quoted value"` framing). Registers as a plain grid
- * surface (legacy `ADD-DEVICE` form — `KEYS_TOTAL`/`KEYS_PER_ROW`/`BITMAPS`, no
- * `LAYOUT_MANIFEST`), reports the bitmaps Companion streams for each button, and forwards
- * button presses back. Protocol confirmed against `bitfocus/companion-satellite` and
- * `bitfocus/companion` source.
+ * line-based `COMMAND key=value key2="quoted value"` framing). Registers via the
+ * `LAYOUT_MANIFEST` `ADD-DEVICE` form — each button explicitly declares its own
+ * `(row, column)` position on Companion's real page grid — rather than the legacy
+ * `KEYS_TOTAL`/`KEYS_PER_ROW` form, which always anchors at row 0/column 0 with no way to
+ * offset into the page; `LAYOUT_MANIFEST` is what makes showing an arbitrary sub-rectangle of
+ * a larger page possible. Reports the bitmaps Companion streams for each button (keyed by
+ * `CONTROLID`, the manifest's own id scheme) and forwards button presses back. Protocol
+ * confirmed against `bitfocus/companion-satellite` and `bitfocus/companion` source.
  *
  * No UI-toolkit dependency by design — [onButtonUpdated] hands back raw RGB bytes so any
  * consumer (Compose, a CLI, a test) can decode them however it likes.
@@ -68,6 +71,12 @@ class CompanionSatelliteClient(
         rows: Int,
         columns: Int,
         bitmapSize: Int,
+        /** Top-left corner of Companion's real page grid that this device's controls map onto —
+         * 0/0 shows the page's own top-left corner (the only option the legacy KEYS_TOTAL/
+         * KEYS_PER_ROW registration ever supported); any other value shows an arbitrary
+         * sub-rectangle instead, which is why registration always uses LAYOUT_MANIFEST now. */
+        startRow: Int = 0,
+        startColumn: Int = 0,
         productName: String = "ChurchPresenter",
         reconnectDelayMs: Long = 2000L
     ) {
@@ -75,7 +84,7 @@ class CompanionSatelliteClient(
         activeDeviceId = deviceId
         onButtonsReset(rows * columns)
         connectJob = scope.launch {
-            connectLoop(host, port, deviceId, rows, columns, bitmapSize, productName, reconnectDelayMs)
+            connectLoop(host, port, deviceId, rows, columns, startRow, startColumn, bitmapSize, productName, reconnectDelayMs)
         }
     }
 
@@ -94,14 +103,17 @@ class CompanionSatelliteClient(
         scope.cancel()
     }
 
-    /** Sends a down-then-up press for the button at [index], as a real key press would. */
+    /** Sends a down-then-up press for the button at [index], as a real key press would.
+     * CONTROLID (not KEY) identifies the button for a LAYOUT_MANIFEST-registered device — its
+     * value is simply [index]'s string form, matching the control id assigned during
+     * [buildLayoutManifest]. */
     fun pressButton(index: Int) {
         val deviceId = activeDeviceId
         if (deviceId.isEmpty() || currentStatus != CompanionConnectionStatus.CONNECTED) return
         scope.launch {
-            sendMessage("KEY-PRESS", deviceId, linkedMapOf("KEY" to index, "PRESSED" to true))
+            sendMessage("KEY-PRESS", deviceId, linkedMapOf("CONTROLID" to index.toString(), "PRESSED" to true))
             delay(80)
-            sendMessage("KEY-PRESS", deviceId, linkedMapOf("KEY" to index, "PRESSED" to false))
+            sendMessage("KEY-PRESS", deviceId, linkedMapOf("CONTROLID" to index.toString(), "PRESSED" to false))
         }
     }
 
@@ -129,6 +141,8 @@ class CompanionSatelliteClient(
         deviceId: String,
         rows: Int,
         columns: Int,
+        startRow: Int,
+        startColumn: Int,
         bitmapSize: Int,
         productName: String,
         reconnectDelayMs: Long
@@ -152,7 +166,7 @@ class CompanionSatelliteClient(
                     try {
                         while (scope.isActive) {
                             val line = reader.readLine() ?: break
-                            handleLine(line, deviceId, rows, columns, bitmapSize, productName)
+                            handleLine(line, deviceId, rows, columns, startRow, startColumn, bitmapSize, productName)
                         }
                     } finally {
                         pingJob.cancel()
@@ -171,7 +185,16 @@ class CompanionSatelliteClient(
         }
     }
 
-    private fun handleLine(line: String, deviceId: String, rows: Int, columns: Int, bitmapSize: Int, productName: String) {
+    private fun handleLine(
+        line: String,
+        deviceId: String,
+        rows: Int,
+        columns: Int,
+        startRow: Int,
+        startColumn: Int,
+        bitmapSize: Int,
+        productName: String
+    ) {
         val trimmed = line.removeSuffix("\r")
         val spaceIndex = trimmed.indexOf(' ')
         val cmd = if (spaceIndex == -1) trimmed else trimmed.substring(0, spaceIndex)
@@ -180,7 +203,7 @@ class CompanionSatelliteClient(
 
         when (cmd.uppercase()) {
             "PING" -> writeLine("PONG $body\n")
-            "BEGIN" -> registerDevice(deviceId, rows, columns, bitmapSize, productName)
+            "BEGIN" -> registerDevice(deviceId, rows, columns, startRow, startColumn, bitmapSize, productName)
             "ADD-DEVICE" -> {
                 if ("OK" in params) {
                     setStatus(CompanionConnectionStatus.CONNECTED, null)
@@ -196,8 +219,11 @@ class CompanionSatelliteClient(
         }
     }
 
+    /** CONTROLID (not KEY) identifies the button for a LAYOUT_MANIFEST-registered device — its
+     * value is the control id assigned during [buildLayoutManifest], which is simply our button
+     * index's string form, so parsing it back to Int reproduces the original index unchanged. */
     private fun handleKeyState(params: Map<String, String>, bitmapSize: Int) {
-        val keyIndex = params["KEY"]?.toIntOrNull() ?: return
+        val keyIndex = params["CONTROLID"]?.toIntOrNull() ?: return
         val bitmapRgb = params["BITMAP"]?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
         val text = params["TEXT"]?.let { runCatching { String(Base64.getDecoder().decode(it)) }.getOrDefault("") } ?: ""
         val page = params["LOCATION"]?.substringBefore('/')?.toIntOrNull()
@@ -215,16 +241,19 @@ class CompanionSatelliteClient(
         )
     }
 
-    private fun registerDevice(deviceId: String, rows: Int, columns: Int, bitmapSize: Int, productName: String) {
+    private fun registerDevice(
+        deviceId: String,
+        rows: Int,
+        columns: Int,
+        startRow: Int,
+        startColumn: Int,
+        bitmapSize: Int,
+        productName: String
+    ) {
         sendMessage(
             "ADD-DEVICE", deviceId, linkedMapOf(
                 "PRODUCT_NAME" to productName,
-                "KEYS_TOTAL" to rows * columns,
-                "KEYS_PER_ROW" to columns,
-                "BITMAPS" to bitmapSize,
-                "COLORS" to true,
-                "TEXT" to true,
-                "TEXT_STYLE" to false,
+                "LAYOUT_MANIFEST" to buildLayoutManifest(rows, columns, startRow, startColumn, bitmapSize),
                 "BRIGHTNESS" to false,
                 // Declares the capability so Companion's Surfaces settings panel offers a "change
                 // page" permission toggle for this device — CHANGE-PAGE is a no-op until the admin
@@ -233,6 +262,29 @@ class CompanionSatelliteClient(
                 "VARIABLES" to Base64.getEncoder().encodeToString("[]".toByteArray())
             )
         )
+    }
+
+    /** Builds a base64-encoded LAYOUT_MANIFEST JSON blob matching Companion's
+     * `satellite-surface.schema.json` exactly (verified against a live instance — the schema's
+     * `size` def requires `w`/`h`, not `width`/`height`, and rejects the whole ADD-DEVICE with
+     * "Invalid LAYOUT_MANIFEST" if violated): `{stylePresets: {default: {bitmap: {w, h}, text,
+     * textStyle, colors}}, controls: {"<id>": {row, column}, ...}}`. Control id `i` maps to
+     * real-page position `(startRow + i/columns, startColumn + i%columns)` — this explicit
+     * per-control positioning is what makes a chosen sub-rectangle of the page possible at all;
+     * the legacy KEYS_TOTAL/KEYS_PER_ROW form Companion also supports has no offset concept and
+     * always anchors at (0, 0). No JSON library needed — the shape is small and fixed enough to
+     * build by hand. */
+    private fun buildLayoutManifest(rows: Int, columns: Int, startRow: Int, startColumn: Int, bitmapSize: Int): String {
+        val controls = buildString {
+            for (i in 0 until rows * columns) {
+                if (i > 0) append(',')
+                append("\"").append(i).append("\":{\"row\":").append(startRow + i / columns)
+                    .append(",\"column\":").append(startColumn + i % columns).append('}')
+            }
+        }
+        val json = "{\"stylePresets\":{\"default\":{\"bitmap\":{\"w\":$bitmapSize,\"h\":$bitmapSize}," +
+            "\"text\":true,\"textStyle\":false,\"colors\":\"hex\"}},\"controls\":{$controls}}"
+        return Base64.getEncoder().encodeToString(json.toByteArray(Charsets.UTF_8))
     }
 
     private fun sendMessage(name: String, deviceId: String?, args: Map<String, Any>) {
