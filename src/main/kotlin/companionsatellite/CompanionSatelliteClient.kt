@@ -1,0 +1,241 @@
+package companionsatellite
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.net.Socket
+import java.util.Base64
+
+enum class CompanionConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
+
+/** One button's state as last reported by Companion, in protocol-native form. */
+data class CompanionButtonUpdate(
+    val index: Int,
+    val bitmapRgb: ByteArray? = null,
+    val bitmapSize: Int = 0,
+    val text: String = "",
+    val color: String? = null,
+    val textColor: String? = null,
+    val pressed: Boolean = false
+)
+
+/**
+ * Client for Bitfocus Companion's Satellite protocol (plain TCP, default port 16622,
+ * line-based `COMMAND key=value key2="quoted value"` framing). Registers as a plain grid
+ * surface (legacy `ADD-DEVICE` form — `KEYS_TOTAL`/`KEYS_PER_ROW`/`BITMAPS`, no
+ * `LAYOUT_MANIFEST`), reports the bitmaps Companion streams for each button, and forwards
+ * button presses back. Protocol confirmed against `bitfocus/companion-satellite` and
+ * `bitfocus/companion` source.
+ *
+ * No UI-toolkit dependency by design — [onButtonUpdated] hands back raw RGB bytes so any
+ * consumer (Compose, a CLI, a test) can decode them however it likes.
+ */
+class CompanionSatelliteClient(
+    private val onStatusChanged: (CompanionConnectionStatus, String?) -> Unit,
+    private val onButtonUpdated: (CompanionButtonUpdate) -> Unit,
+    private val onButtonsReset: (count: Int) -> Unit
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var connectJob: Job? = null
+    private var socket: Socket? = null
+    private var writer: OutputStream? = null
+    private val writeLock = Any()
+    private var activeDeviceId: String = ""
+
+    @Volatile private var currentStatus = CompanionConnectionStatus.DISCONNECTED
+
+    fun connect(host: String, port: Int, deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+        disconnect()
+        activeDeviceId = deviceId
+        onButtonsReset(rows * columns)
+        connectJob = scope.launch { connectLoop(host, port, deviceId, rows, columns, bitmapSize) }
+    }
+
+    fun disconnect() {
+        connectJob?.cancel()
+        connectJob = null
+        runCatching { socket?.close() }
+        socket = null
+        writer = null
+        activeDeviceId = ""
+        setStatus(CompanionConnectionStatus.DISCONNECTED, null)
+    }
+
+    fun dispose() {
+        disconnect()
+        scope.cancel()
+    }
+
+    /** Sends a down-then-up press for the button at [index], as a real key press would. */
+    fun pressButton(index: Int) {
+        val deviceId = activeDeviceId
+        if (deviceId.isEmpty() || currentStatus != CompanionConnectionStatus.CONNECTED) return
+        scope.launch {
+            sendMessage("KEY-PRESS", deviceId, linkedMapOf("KEY" to index, "PRESSED" to true))
+            delay(80)
+            sendMessage("KEY-PRESS", deviceId, linkedMapOf("KEY" to index, "PRESSED" to false))
+        }
+    }
+
+    private fun setStatus(status: CompanionConnectionStatus, error: String?) {
+        currentStatus = status
+        onStatusChanged(status, error)
+    }
+
+    private suspend fun connectLoop(host: String, port: Int, deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+        while (scope.isActive) {
+            setStatus(CompanionConnectionStatus.CONNECTING, null)
+            try {
+                Socket(host, port).use { s ->
+                    socket = s
+                    writer = s.getOutputStream()
+                    val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
+                    while (scope.isActive) {
+                        val line = reader.readLine() ?: break
+                        handleLine(line, deviceId, rows, columns, bitmapSize)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                setStatus(CompanionConnectionStatus.ERROR, e.message ?: "Connection failed")
+            }
+            socket = null
+            writer = null
+            if (currentStatus != CompanionConnectionStatus.ERROR) setStatus(CompanionConnectionStatus.DISCONNECTED, null)
+            if (!scope.isActive) break
+            delay(2000)
+        }
+    }
+
+    private fun handleLine(line: String, deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+        val trimmed = line.removeSuffix("\r")
+        val spaceIndex = trimmed.indexOf(' ')
+        val cmd = if (spaceIndex == -1) trimmed else trimmed.substring(0, spaceIndex)
+        val body = if (spaceIndex == -1) "" else trimmed.substring(spaceIndex + 1)
+        val params = parseLineParameters(body)
+
+        when (cmd.uppercase()) {
+            "PING" -> writeLine("PONG $body\n")
+            "BEGIN" -> registerDevice(deviceId, rows, columns, bitmapSize)
+            "ADD-DEVICE" -> {
+                if ("OK" in params) {
+                    setStatus(CompanionConnectionStatus.CONNECTED, null)
+                } else {
+                    setStatus(CompanionConnectionStatus.ERROR, params["MESSAGE"] ?: "Device registration failed")
+                }
+            }
+            "KEY-STATE" -> handleKeyState(params, bitmapSize)
+            "KEYS-CLEAR" -> onButtonsReset(rows * columns)
+            // BRIGHTNESS has no physical meaning for a software surface; PONG/REMOVE-DEVICE/
+            // DEVICE-CONFIG/CAPS need no action for a plain grid client.
+            else -> {}
+        }
+    }
+
+    private fun handleKeyState(params: Map<String, String>, bitmapSize: Int) {
+        val keyIndex = params["KEY"]?.toIntOrNull() ?: return
+        val bitmapRgb = params["BITMAP"]?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
+        val text = params["TEXT"]?.let { runCatching { String(Base64.getDecoder().decode(it)) }.getOrDefault("") } ?: ""
+        onButtonUpdated(
+            CompanionButtonUpdate(
+                index = keyIndex,
+                bitmapRgb = bitmapRgb,
+                bitmapSize = bitmapSize,
+                text = text,
+                color = params["COLOR"],
+                textColor = params["TEXTCOLOR"],
+                pressed = params["PRESSED"] == "1"
+            )
+        )
+    }
+
+    private fun registerDevice(deviceId: String, rows: Int, columns: Int, bitmapSize: Int) {
+        sendMessage(
+            "ADD-DEVICE", deviceId, linkedMapOf(
+                "PRODUCT_NAME" to "ChurchPresenter",
+                "KEYS_TOTAL" to rows * columns,
+                "KEYS_PER_ROW" to columns,
+                "BITMAPS" to bitmapSize,
+                "COLORS" to true,
+                "TEXT" to true,
+                "TEXT_STYLE" to false,
+                "BRIGHTNESS" to false,
+                "VARIABLES" to Base64.getEncoder().encodeToString("[]".toByteArray())
+            )
+        )
+    }
+
+    private fun sendMessage(name: String, deviceId: String?, args: Map<String, Any>) {
+        val line = buildString {
+            append(name)
+            if (deviceId != null) append(" DEVICEID=\"").append(deviceId).append('"')
+            for ((key, value) in args) {
+                append(' ').append(key).append('=')
+                when (value) {
+                    is Boolean -> append(if (value) "1" else "0")
+                    is Number -> append(value.toString())
+                    else -> append('"').append(value.toString()).append('"')
+                }
+            }
+            append('\n')
+        }
+        writeLine(line)
+    }
+
+    private fun writeLine(line: String) {
+        val out = writer ?: return
+        synchronized(writeLock) {
+            runCatching {
+                out.write(line.toByteArray(Charsets.UTF_8))
+                out.flush()
+            }
+        }
+    }
+
+    /** Parses `key=value key2="quoted value" boolFlag` tokens, splitting each on the first `=`
+     * only (so base64 padding `=` inside a value isn't corrupted). Bare tokens map to `"true"`. */
+    private fun parseLineParameters(line: String): Map<String, String> {
+        val fragments = mutableListOf(StringBuilder())
+        var inQuotes = false
+        var i = 0
+        while (i < line.length) {
+            val c = line[i]
+            when {
+                c == '\\' && i + 1 < line.length -> {
+                    fragments.last().append(line[i + 1])
+                    i += 2
+                }
+                c == '"' -> {
+                    inQuotes = !inQuotes
+                    i++
+                }
+                c == ' ' && !inQuotes -> {
+                    fragments.add(StringBuilder())
+                    i++
+                }
+                else -> {
+                    fragments.last().append(c)
+                    i++
+                }
+            }
+        }
+        val result = mutableMapOf<String, String>()
+        for (fragment in fragments) {
+            val token = fragment.toString()
+            if (token.isEmpty()) continue
+            val eq = token.indexOf('=')
+            if (eq == -1) result[token] = "true" else result[token.substring(0, eq)] = token.substring(eq + 1)
+        }
+        return result
+    }
+}
