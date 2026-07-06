@@ -25,7 +25,9 @@ data class CompanionButtonUpdate(
     val text: String = "",
     val color: String? = null,
     val textColor: String? = null,
-    val pressed: Boolean = false
+    val pressed: Boolean = false,
+    /** Parsed from `LOCATION="page/row/column"` (API >= 1.10.0) — null if Companion omits it. */
+    val page: Int? = null
 )
 
 /**
@@ -88,6 +90,19 @@ class CompanionSatelliteClient(
             sendMessage("KEY-PRESS", deviceId, linkedMapOf("KEY" to index, "PRESSED" to true))
             delay(80)
             sendMessage("KEY-PRESS", deviceId, linkedMapOf("KEY" to index, "PRESSED" to false))
+        }
+    }
+
+    /** Requests [times] relative page navigations (Companion's protocol has no "go to page N" — only
+     * step forward/backward), paced so Companion has time to process each before the next. */
+    fun changePage(forward: Boolean, times: Int = 1) {
+        val deviceId = activeDeviceId
+        if (deviceId.isEmpty() || currentStatus != CompanionConnectionStatus.CONNECTED || times <= 0) return
+        scope.launch {
+            repeat(times) {
+                sendMessage("CHANGE-PAGE", deviceId, linkedMapOf("DIRECTION" to forward))
+                delay(150)
+            }
         }
     }
 
@@ -164,6 +179,7 @@ class CompanionSatelliteClient(
         val keyIndex = params["KEY"]?.toIntOrNull() ?: return
         val bitmapRgb = params["BITMAP"]?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
         val text = params["TEXT"]?.let { runCatching { String(Base64.getDecoder().decode(it)) }.getOrDefault("") } ?: ""
+        val page = params["LOCATION"]?.substringBefore('/')?.toIntOrNull()
         onButtonUpdated(
             CompanionButtonUpdate(
                 index = keyIndex,
@@ -172,7 +188,8 @@ class CompanionSatelliteClient(
                 text = text,
                 color = params["COLOR"],
                 textColor = params["TEXTCOLOR"],
-                pressed = params["PRESSED"] == "1"
+                pressed = params["PRESSED"] == "1",
+                page = page
             )
         )
     }
